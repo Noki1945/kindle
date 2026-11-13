@@ -1,0 +1,11 @@
+/build*/
+/.tools/
+/runtime/
+/dist/
+.env
+.env.*
+*.pem
+*.key
+kindle_ed25519*
+known_hosts
+*.user

@@ -1,0 +1,16 @@
+set(CMAKE_SYSTEM_NAME Linux)
+set(CMAKE_SYSTEM_PROCESSOR arm)
+# Supply a Kindle-compatible hard-float compiler AND firmware-matching sysroot.
+# A generic Ubuntu armhf sysroot is not a compatibility guarantee.
+set(CMAKE_C_COMPILER "$ENV{KINDLE_TOOLCHAIN}/bin/arm-linux-gnueabihf-gcc")
+set(CMAKE_CXX_COMPILER "$ENV{KINDLE_TOOLCHAIN}/bin/arm-linux-gnueabihf-g++")
+if(NOT EXISTS "$ENV{KINDLE_SYSROOT}/lib/ld-linux-armhf.so.3")
+  message(FATAL_ERROR "KINDLE_SYSROOT must contain the confirmed Kindle hard-float loader")
+endif()
+set(CMAKE_SYSROOT "$ENV{KINDLE_SYSROOT}")
+set(CMAKE_FIND_ROOT_PATH "${CMAKE_SYSROOT}")
+set(CMAKE_FIND_ROOT_PATH_MODE_PROGRAM NEVER)
+set(CMAKE_FIND_ROOT_PATH_MODE_LIBRARY ONLY)
+set(CMAKE_FIND_ROOT_PATH_MODE_INCLUDE ONLY)
+set(CMAKE_CXX_FLAGS_INIT "-Os -ffunction-sections -fdata-sections")
+set(CMAKE_EXE_LINKER_FLAGS_INIT "-Wl,--gc-sections")
