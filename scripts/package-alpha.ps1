@@ -27,6 +27,7 @@ foreach($pair in @(@('lib/libc/musl/COPYRIGHT','musl.txt'),@('lib/libcxx/LICENSE
 $deviceArchive=Join-Path $output "kindle-lite-$Version-pw4.zip"
 $windowsArchive=Join-Path $output "kindle-lite-$Version-windows-x64.zip"
 foreach($archive in @($deviceArchive,$windowsArchive)) { if(Test-Path -LiteralPath $archive) { throw "Archive already exists: $archive" } }
+Add-Type -AssemblyName System.IO.Compression
 Add-Type -AssemblyName System.IO.Compression.FileSystem
 function Write-PackageZip([string]$Source, [string]$Destination) {
     $sourceRoot=[IO.Path]::GetFullPath($Source).TrimEnd('\','/')
