@@ -25,6 +25,9 @@ int main() {
         store.save("A", {100, 25, true}); store.save("A", {200, 25, true});
         check(store.load("A").offset == 200 && store.load("A").has_bookmark, "state replacement");
         check(store.load("B").offset == 0, "state isolation");
+        store.save("layout", {2, 1, true, "/body/section[2]/p[1].0", "/body/section[1]/p[3].0"});
+        auto layout = store.load("layout");
+        check(layout.position == "/body/section[2]/p[1].0" && layout.bookmark_position == "/body/section[1]/p[3].0", "Stable layout positions survive state persistence");
         store.set_last_book("a path with spaces.txt"); check(store.last_book() == "a path with spaces.txt", "last book");
         Settings s; s.font = 28; s.line_spacing = 10; store.save_settings(s); check(store.settings().font == 28, "settings round trip");
         auto book = root / "unicode.txt";

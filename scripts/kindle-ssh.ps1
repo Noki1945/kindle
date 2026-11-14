@@ -12,6 +12,8 @@ if (-not (Test-Path -LiteralPath $privateKey)) {
 }
 
 $sshArguments = @(
+    '-F', 'NUL',
+    '-b', '192.168.15.100',
     '-i', $privateKey,
     '-o', 'IdentitiesOnly=yes',
     '-o', 'StrictHostKeyChecking=yes',

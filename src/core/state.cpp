@@ -29,10 +29,11 @@ ReadingState StateStore::load(const std::string& book) const {
     ReadingState s; std::string path;
     std::ifstream in(root_ / (key(book) + ".state"));
     if (!(in >> std::quoted(path) >> s.offset >> s.bookmark >> s.has_bookmark) || path != book) return {};
+    in >> std::quoted(s.position) >> std::quoted(s.bookmark_position);
     return s;
 }
 void StateStore::save(const std::string& book, const ReadingState& s) const {
-    std::ostringstream out; out << std::quoted(book) << ' ' << s.offset << ' ' << s.bookmark << ' ' << s.has_bookmark << '\n';
+    std::ostringstream out; out << std::quoted(book) << ' ' << s.offset << ' ' << s.bookmark << ' ' << s.has_bookmark << ' ' << std::quoted(s.position) << ' ' << std::quoted(s.bookmark_position) << '\n';
     write(root_ / (key(book) + ".state"), out.str());
 }
 Settings StateStore::settings() const {

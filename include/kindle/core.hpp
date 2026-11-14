@@ -21,7 +21,7 @@ public:
 };
 struct TextPage { std::string text; std::uint64_t start = 0, next = 0; bool end = false; };
 TextPage read_page(const fs::path& file, std::uint64_t offset, unsigned columns, unsigned lines);
-struct ReadingState { std::uint64_t offset = 0, bookmark = 0; bool has_bookmark = false; };
+struct ReadingState { std::uint64_t offset = 0, bookmark = 0; bool has_bookmark = false; std::string position, bookmark_position; };
 struct Settings { unsigned font = 22, line_spacing = 6; bool wifi_demo = false; unsigned light_demo = 12; };
 class StateStore {
     fs::path root_;

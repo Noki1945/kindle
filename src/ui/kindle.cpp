@@ -1,12 +1,15 @@
 #include "kindle/core.hpp"
 #include "kindle/document.hpp"
 #include "kindle/web.hpp"
+#include "kindle/native_reader.hpp"
+#include "kindle/device_status.hpp"
 #include <linux/input.h>
 #include <linux/fb.h>
 #include <sys/ioctl.h>
 #include <sys/wait.h>
 #include <sys/file.h>
 #include <sys/signalfd.h>
+#include <sys/timerfd.h>
 #include <fcntl.h>
 #include <poll.h>
 #include <unistd.h>
@@ -17,10 +20,12 @@
 #include <stdexcept>
 #include <algorithm>
 #include <limits>
+#include <memory>
 
 namespace {
 using namespace kindle;
 volatile sig_atomic_t stopped = 0;
+int handoff = 0;
 int signal_descriptor = -1;
 void consume_signals() {
     signalfd_siginfo information{};
@@ -90,6 +95,20 @@ struct PowerEvents {
     }
 };
 
+struct StatusTimer {
+    int descriptor = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK | TFD_CLOEXEC);
+    StatusTimer() {
+        if (descriptor < 0) throw std::runtime_error("Cannot create status timer");
+        arm(true);
+    }
+    ~StatusTimer() { if (descriptor >= 0) close(descriptor); }
+    void arm(bool enabled) {
+        itimerspec interval{};
+        if (enabled) interval.it_value.tv_sec = interval.it_interval.tv_sec = 60;
+        if (timerfd_settime(descriptor, 0, &interval, nullptr)) throw std::runtime_error("Cannot configure status timer");
+    }
+};
+
 void text(int top, int bottom, const std::string& value, int size = 36, int left = 40, int right = 1032) {
     if (value.empty()) return;
     std::string options = "regular=/usr/java/lib/fonts/Bookerly-Regular.ttf,px=" + std::to_string(size)
@@ -98,13 +117,36 @@ void text(int top, int bottom, const std::string& value, int size = 36, int left
     draw({"-q", "-b", "-t", options, "--", value});
 }
 
+class Canvas {
+    int width, height;
+    std::vector<unsigned char> pixels;
+public:
+    Canvas(int width = 1072, int height = 1448) : width(width), height(height), pixels(width * height, 255) {}
+    void rectangle(int x, int y, int width, int height, unsigned char shade = 0, int thickness = 2) {
+        for (int row = std::max(0, y); row < std::min(this->height, y + height); ++row)
+            for (int col = std::max(0, x); col < std::min(this->width, x + width); ++col)
+                if (row < y + thickness || row >= y + height - thickness || col < x + thickness || col >= x + width - thickness)
+                    pixels[row * this->width + col] = shade;
+    }
+    void show(const std::string& path = "/tmp/kindle-lite-shell.pgm", int x = 0, int y = 0) {
+        std::ofstream out(path, std::ios::binary);
+        out << "P5\n" << width << ' ' << height << "\n255\n";
+        out.write(reinterpret_cast<const char*>(pixels.data()), pixels.size()); out.close();
+        if (!out) throw std::runtime_error("Cannot draw interface surface");
+        draw({"-q", "-b", "-g", "file=" + path + ",x=" + std::to_string(x) + ",y=" + std::to_string(y)});
+    }
+};
+
 class Shell {
     Catalog catalog{"books", "runtime/catalog"};
     StateStore store{"runtime/state"};
     Settings settings = store.settings();
     CatalogPage books;
     std::string cursor, current, message;
+    std::optional<DeviceStatus> displayed_status;
     fs::path reading_file;
+    std::unique_ptr<NativeReader> native_reader;
+    std::uint64_t native_pages = 0;
     std::vector<std::string> cursors;
     std::vector<std::uint64_t> history;
     ReadingState progress;
@@ -116,14 +158,62 @@ class Shell {
     TextPage web_page;
     std::vector<std::uint64_t> web_offsets;
     std::vector<std::string> web_history;
-    std::string address = "https://example.com", web_message;
-    int web_mode = 0; // article, address keyboard, link list
+    std::string address = "https://www.google.com/", web_message;
+    int web_mode = 3; // article, address keyboard, link list, start page
     bool upper_keys = false;
     std::size_t link_start = 0;
     const std::vector<std::string> keys = {"1234567890-.", "qwertyuiop/:", "asdfghjkl_?=", "zxcvbnm&%+#@"};
 public:
-    Shell() { if (!fs::exists("runtime/catalog")) catalog.rebuild(); books = catalog.page(""); }
+    void refresh_status(bool force = false) {
+        const auto status = read_device_status();
+        if (!force && displayed_status && *displayed_status == status) return;
+        Canvas panel(395, 75);
+        for (unsigned bar = 0; bar < 4; ++bar) {
+            const int height = 8 + static_cast<int>(bar) * 6;
+            panel.rectangle(20 + static_cast<int>(bar) * 8, 47 - height, 5, height,
+                status.wifi == WifiState::connected && bar < status.signal_bars ? 0 : 195, height);
+        }
+        panel.rectangle(248, 26, 38, 24, 0, 2);
+        panel.rectangle(286, 33, 4, 10, 0, 10);
+        if (status.battery_percent) panel.rectangle(252, 30, 30 * *status.battery_percent / 100, 16, 0, 16);
+        panel.show("/tmp/kindle-lite-status.pgm", 440, 15);
+        const char* wifi = "Wi-Fi ?";
+        switch (status.wifi) {
+            case WifiState::off: wifi = "Wi-Fi выкл"; break;
+            case WifiState::disconnected: wifi = "Wi-Fi нет сети"; break;
+            case WifiState::connected: wifi = "Wi-Fi"; break;
+            case WifiState::unknown: break;
+        }
+        text(25, 95, wifi, 22, 500, 680);
+        auto battery = status.battery_percent ? std::to_string(*status.battery_percent) + "%" : "—%";
+        if (status.charging) battery += " +";
+        text(25, 95, battery, 24, 740, 835);
+        if (!force) draw({"-q", "-s", "top=15,left=440,width=395,height=75", "-w"});
+        displayed_status = status;
+    }
+    Shell() {
+        std::string downloads_revision, indexed_revision;
+        const auto downloads = catalog.root() / "Downloads";
+        if (fs::is_directory(downloads)) {
+            downloads_revision = std::to_string(fs::last_write_time(downloads).time_since_epoch().count());
+            std::ifstream previous("runtime/downloads.stamp");
+            std::getline(previous, indexed_revision);
+        }
+        if (!fs::exists("runtime/catalog") || downloads_revision != indexed_revision) catalog.rebuild();
+        if (!downloads_revision.empty()) {
+            std::ofstream stamp("runtime/downloads.stamp");
+            stamp << downloads_revision << '\n';
+        }
+        books = catalog.page("");
+    }
     void load_page() {
+        if (native_reader) {
+            auto rendered = native_reader->seek(progress.offset, progress.position);
+            progress.offset = rendered.page; progress.position = rendered.position; native_pages = rendered.count;
+            page = {"", rendered.page, rendered.page + 1, rendered.page + 1 >= rendered.count};
+            std::cout << "LAYOUT page=" << rendered.page + 1 << " total=" << rendered.count << std::endl;
+            return;
+        }
         const unsigned pixels = settings.font + 10;
         const unsigned columns = 960 / pixels;
         const unsigned lines = 820 / (pixels * 2);
@@ -131,9 +221,20 @@ public:
         progress.offset = page.start;
         std::cout << "READ offset=" << page.start << " next=" << page.next << " end=" << page.end << std::endl;
     }
-    void save() { if (!current.empty()) store.save(current, progress); store.save_settings(settings); }
+    std::string state_key() const { return native_reader ? "layout:" + current : current; }
+    void save() { if (!current.empty()) store.save(state_key(), progress); store.save_settings(settings); }
     int browser_descriptor() const { return request.descriptor(); }
     void sleep() { save(); request.cancel(); }
+    bool full_browser_ready() const { return fs::exists("engines/browser/READY") && fs::exists("full-browser.sh"); }
+    void open_site(const std::string& url) {
+        auto target = url.find("://") == std::string::npos ? "https://" + url : url;
+        if (full_browser_ready() && https_url(target)) {
+            save(); fs::create_directories("runtime");
+            std::ofstream file("runtime/browser-launch.url", std::ios::binary); file << target; file.close();
+            if (!file) { web_message = "Не удалось открыть браузер"; return; }
+            handoff = 100; stopped = 1;
+        } else begin_web(target);
+    }
     void begin_web(std::string url, bool record = true) {
         try {
             if (url.find("://") == std::string::npos) url = "https://" + url;
@@ -163,7 +264,19 @@ public:
         if (scene == 1 && !reading) paint();
     }
     void paint_browser() {
-        if (web_mode == 1) {
+        if (web_mode == 3) {
+            text(285, 365, "Интернет", 46);
+            text(380, 440, full_browser_ready() ? "Chromium · JavaScript · картинки · CSS" : "Текстовый просмотр · установка Chromium", 26);
+            text(530, 630, "Google", 40, 65, 500);
+            text(530, 630, "Алиса", 40, 595, 1010);
+            text(790, 860, "DeepSeek", 38, 65, 500);
+            text(790, 860, "Pinterest", 38, 595, 1010);
+            text(1010, 1090, "Wikipedia", 36, 65, 500);
+            text(1010, 1090, "ChatGPT", 38, 595, 1010);
+            text(1195, 1280, shortened(web_message, 110), 25);
+            text(1340, 1425, "Ввести адрес", 32, 65, 700);
+            return;
+        } else if (web_mode == 1) {
             text(280, 360, "Введите адрес HTTPS", 32);
             auto shown = address.size() > 180 ? address.substr(address.size() - 180) : address;
             while (!shown.empty() && (static_cast<unsigned char>(shown[0]) & 0xc0) == 0x80) shown.erase(shown.begin());
@@ -190,7 +303,13 @@ public:
         }
     }
     void browser_tap(int x, int y) {
-        if (web_mode == 1) {
+        if (web_mode == 3) {
+            if (y >= 470 && y < 710) open_site(x < 536 ? "https://www.google.com/" : "https://alice.yandex.ru/");
+            else if (y >= 750 && y < 930) open_site(x < 536 ? "https://chat.deepseek.com/" : "https://ru.pinterest.com/");
+            else if (y >= 970 && y < 1130) open_site(x < 536 ? "https://ru.wikipedia.org/" : "https://chatgpt.com/");
+            else if (y >= 1310) web_mode = 1;
+            else return;
+        } else if (web_mode == 1) {
             if (y >= 740 && y < 810) {
                 if (x < 357) upper_keys = !upper_keys;
                 else if (address.size() < 2040) address += x < 714 ? ".com" : ".ru";
@@ -202,10 +321,10 @@ public:
                     if (!address.empty()) { auto i = address.size() - 1; while (i && (static_cast<unsigned char>(address[i]) & 0xc0) == 0x80) --i; address.resize(i); }
                 }
                 else if (x < 714) address.clear();
-                else begin_web(address);
+                else open_site(address);
             } else if (y >= 1350) {
                 if (x < 357) web_mode = 0;
-                else begin_web(x < 714 ? "https://example.com" : "https://ru.wikipedia.org/wiki/Заглавная_страница");
+                else open_site(x < 714 ? "https://www.google.com/" : "https://ru.wikipedia.org/wiki/Заглавная_страница");
             } else return;
         } else if (web_mode == 2) {
             if (y >= 340 && y < 1180) {
@@ -229,7 +348,7 @@ public:
                 catch (const std::exception& e) { web_message = e.what(); }
             } else return;
         }
-        paint();
+        if (!stopped) paint();
     }
     void verify_reader_navigation() {
         if (!reading || page.end) throw std::runtime_error("Navigation smoke test needs a multi-page TXT");
@@ -237,10 +356,10 @@ public:
         auto first = progress.offset;
         auto next = page.next;
         tap(900, 1350);
-        if (progress.offset != next || next <= first || store.load(current).offset != next)
+        if (progress.offset != next || next <= first || store.load(state_key()).offset != next)
             throw std::runtime_error("Next page persistence failed");
         tap(500, 1350);
-        auto saved = store.load(current);
+        auto saved = store.load(state_key());
         if (!saved.has_bookmark || saved.bookmark != next) throw std::runtime_error("Bookmark persistence failed");
         tap(100, 1350);
         if (progress.offset != first) throw std::runtime_error("Previous page failed");
@@ -250,8 +369,9 @@ public:
         progress = original; history.clear(); load_page(); save(); paint();
         std::cout << "PASS reader next/previous/persisted bookmark/reopen" << std::endl;
     }
-    void verify_formats() {
-        for (const auto& name : {"Sample.epub", "Sample.fb2"}) {
+    void verify_formats(const std::string& prefix = {}) {
+        for (const auto& suffix : {"Sample.epub", "Sample.fb2"}) {
+            const auto name = prefix + suffix;
             open(name);
             if (current != name || !reading) throw std::runtime_error("Format did not open");
             verify_reader_navigation();
@@ -286,20 +406,37 @@ public:
     }
     void paint() {
         auto started = std::chrono::steady_clock::now();
-        draw({"-q", "-b", "-k"});
-        text(25, 100, "Kindle Lite OS", 32, 40, 800);
+        Canvas background;
+        background.rectangle(24, 106, 1024, 2, 190, 2);
+        background.rectangle(850, 15, 198, 80, 80, 2);
+        for (int tab = 0; tab < 3; ++tab) background.rectangle(20 + tab * 357, 120, 318, 108, 0, scene == tab ? 4 : 1);
+        if (!reading && scene == 0) {
+            for (std::size_t i = 0; i < books.books.size(); ++i) background.rectangle(24, 292 + static_cast<int>(i) * 108, 1024, 102, 170, 1);
+        }
+        if (!reading && scene == 1 && web_mode == 3) {
+            background.rectangle(24, 470, 494, 240, 0, 3); background.rectangle(554, 470, 494, 240, 0, 3);
+            background.rectangle(24, 750, 494, 180, 120, 2); background.rectangle(554, 750, 494, 180, 120, 2);
+            background.rectangle(24, 970, 494, 160, 120, 2); background.rectangle(554, 970, 494, 160, 120, 2);
+        }
+        if (scene != 1 || reading) for (int button = 0; button < 3; ++button) background.rectangle(20 + button * 357, 1300, 318, 128, 80, 2);
+        background.show();
+        text(25, 100, "Kindle Lite OS", 32, 40, 420);
+        refresh_status(true);
         text(25, 100, "Amazon", 32, 870, 1040);
         text(130, 220, "Библиотека", 34, 40, 350);
         text(130, 220, "Браузер", 34, 397, 707);
         text(130, 220, "Настройки", 34, 754, 1032);
         if (reading) {
             text(245, 315, current, 30);
-            text(330, 1250, page.text, settings.font + 10);
+            if (native_reader) {
+                draw({"-q", "-b", "-g", "file=/tmp/kindle-lite-page.png,x=40,y=330"});
+                text(1260, 1295, std::to_string(progress.offset + 1) + " / " + std::to_string(native_pages), 22, 450, 700);
+            } else text(330, 1250, page.text, settings.font + 10);
             text(1310, 1430, "Назад", 32, 40, 350);
             text(1310, 1430, "Закладка", 32, 397, 707);
             text(1310, 1430, "Далее", 32, 754, 1032);
         } else if (scene == 0) {
-            if (books.books.empty()) text(300, 470, "Библиотека пуста. Добавьте книги в kindle-lite/books.");
+            if (books.books.empty()) text(300, 470, "Скачайте EPUB/FB2 в браузере или добавьте книги в kindle-lite/books.");
             for (std::size_t i = 0; i < books.books.size(); ++i)
                 text(300 + static_cast<int>(i) * 108, 390 + static_cast<int>(i) * 108, books.books[i].title + " [" + books.books[i].format + "]");
             text(1190, 1290, message, 28);
@@ -312,22 +449,31 @@ public:
             text(300, 360, "Размер шрифта: " + std::to_string(settings.font));
             text(390, 480, "Уменьшить", 36, 40, 500);
             text(390, 480, "Увеличить", 36, 576, 1032);
-            text(560, 830, "Wi-Fi и подсветка управляются штатными службами.\n\nПроверка сна ещё предстоит.");
+            text(560, 830, "Два режима: чтение и интернет.\n\nПодключить Wi-Fi или точку доступа телефона можно в интерфейсе Amazon.");
             text(900, 980, fs::exists("autostart.enabled") ? "Автозапуск: включён" : "Автозапуск: выключен", 32);
             text(1010, 1080, "Открыть последнюю книгу");
             text(1110, 1190, "Перейти к сохранённой закладке");
         }
         draw({"-q", "-s", "-w"});
         auto milliseconds = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - started).count();
-        std::cout << "PAINT scene=" << scene << " reader=" << reading << " elapsed_ms=" << milliseconds << std::endl;
+        double uptime = 0; std::ifstream("/proc/uptime") >> uptime;
+        std::cout << "PAINT scene=" << scene << " reader=" << reading << " elapsed_ms=" << milliseconds << " boot_seconds=" << uptime << std::endl;
     }
     void open(const std::string& path) {
         auto relative = fs::weakly_canonical(fs::u8path("books") / fs::u8path(path)).lexically_relative(fs::weakly_canonical("books"));
         if (relative.empty() || relative.is_absolute() || *relative.begin() == "..") throw std::runtime_error("Book outside library");
         fs::path prepared;
-        try { prepared = prepare_document(fs::u8path("books") / fs::u8path(path), "runtime/imported"); }
+        auto source = fs::u8path("books") / fs::u8path(path);
+        auto extension = source.extension().u8string();
+        std::transform(extension.begin(), extension.end(), extension.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        bool layout = NativeReader::available() && (extension == ".epub" || extension == ".fb2" || extension == ".txt");
+        try { prepared = layout ? source : prepare_document(source, "runtime/imported"); }
         catch (const std::exception& e) { message = std::string("Не удалось открыть: ") + e.what(); return; }
-        save(); current = path; reading_file = prepared; progress = store.load(path); history.clear(); load_page();
+        save(); native_reader.reset(); current = path; reading_file = prepared; history.clear(); reading = false;
+        try {
+            if (layout) native_reader = std::make_unique<NativeReader>(source, settings.font + 10, [] { consume_signals(); return stopped != 0; });
+            progress = store.load(state_key()); load_page();
+        } catch (const std::exception& e) { native_reader.reset(); current.clear(); message = std::string("Не удалось открыть: ") + e.what(); return; }
         reading = true; store.set_last_book(path);
     }
     void tap(int x, int y) {
@@ -335,9 +481,11 @@ public:
         if (y < 110 && x > 850) { stopped = 1; return; }
         if (y >= 110 && y < 240) { save(); reading = false; scene = std::min(2, x / 357); paint(); return; }
         if (reading && y > 1290) {
-            if (x < 357 && !history.empty()) { progress.offset = history.back(); history.pop_back(); load_page(); }
-            else if (x > 714 && !page.end) { if (history.size() == 256) history.erase(history.begin()); history.push_back(progress.offset); progress.offset = page.next; load_page(); }
-            else if (x >= 357 && x <= 714) { progress.bookmark = progress.offset; progress.has_bookmark = true; }
+            if (x < 357 && (!history.empty() || (native_reader && progress.offset))) {
+                progress.offset = history.empty() ? progress.offset - 1 : history.back(); if (!history.empty()) history.pop_back(); progress.position.clear(); load_page();
+            }
+            else if (x > 714 && !page.end) { if (history.size() == 256) history.erase(history.begin()); history.push_back(progress.offset); progress.offset = page.next; progress.position.clear(); load_page(); }
+            else if (x >= 357 && x <= 714) { progress.bookmark = progress.offset; progress.bookmark_position = progress.position; progress.has_bookmark = true; }
             save(); paint(); return;
         }
         if (reading) return;
@@ -360,7 +508,7 @@ public:
             }
             else if (y >= 1010 && y < 1190) {
                 auto last = store.last_book();
-                if (!last.empty()) { open(last); if (y >= 1090 && progress.has_bookmark) { progress.offset = progress.bookmark; load_page(); } }
+                if (!last.empty()) { open(last); if (y >= 1090 && progress.has_bookmark) { progress.offset = progress.bookmark; progress.position = progress.bookmark_position; load_page(); } }
             } else return;
         } else return;
         paint();
@@ -390,6 +538,13 @@ void capture() {
 int main(int argc, char** argv) {
     if (argc == 4 && std::string(argv[1]) == "--fetch") return fetch_web_worker(argv[2], argv[3]);
     try {
+        if (argc > 1 && std::string(argv[1]) == "--capture") { fs::create_directories("runtime"); capture(); return 0; }
+        if (argc == 3 && std::string(argv[1]) == "--open-browser") {
+            if (!https_url(argv[2])) throw std::runtime_error("Invalid browser address");
+            fs::create_directories("runtime"); std::ofstream file("runtime/browser-launch.url"); file << argv[2]; file.close();
+            if (!file) throw std::runtime_error("Cannot save browser request");
+            return 100;
+        }
         sigset_t signals;
         sigemptyset(&signals);
         for (int number : {SIGTERM, SIGINT, SIGHUP, SIGCHLD}) sigaddset(&signals, number);
@@ -412,8 +567,10 @@ int main(int argc, char** argv) {
         if (ioctl(touch, EVIOCGRAB, 1)) throw std::runtime_error("Cannot acquire touch input");
         Shell shell;
         PowerEvents power;
-        shell.paint();
-        if (argc > 1 && std::string(argv[1]) == "--formats-smoke") { shell.verify_formats(); capture(); shell.save(); return 0; }
+        StatusTimer status_timer;
+        if (argc > 1 && std::string(argv[1]) == "--browser-home") shell.tap(500, 170);
+        else shell.paint();
+        if (argc > 1 && std::string(argv[1]) == "--formats-smoke") { shell.verify_formats(argc > 2 ? argv[2] : ""); capture(); shell.save(); return 0; }
         if (argc > 1 && std::string(argv[1]) == "--browser-smoke") { shell.verify_browser(); capture(); shell.save(); return 0; }
         if (argc > 1 && std::string(argv[1]) == "--smoke") {
             auto original_settings = StateStore("runtime/state").settings();
@@ -432,8 +589,8 @@ int main(int argc, char** argv) {
         while (!stopped) {
             auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - std::chrono::steady_clock::now()).count();
             if (timed && remaining <= 0) break;
-            pollfd descriptors[] = {{touch, POLLIN, 0}, {signal_descriptor, POLLIN, 0}, {shell.browser_descriptor(), POLLIN, 0}, {power.descriptor, POLLIN, 0}};
-            int result = poll(descriptors, 4, timed ? static_cast<int>(remaining) : -1);
+            pollfd descriptors[] = {{touch, POLLIN, 0}, {signal_descriptor, POLLIN, 0}, {shell.browser_descriptor(), POLLIN, 0}, {power.descriptor, POLLIN, 0}, {status_timer.descriptor, POLLIN, 0}};
+            int result = poll(descriptors, 5, timed ? static_cast<int>(remaining) : -1);
             if (result < 0) { if (errno == EINTR) continue; throw std::runtime_error("Input wait failed"); }
             if (!result) break;
             if (descriptors[1].revents & POLLIN) consume_signals();
@@ -445,10 +602,15 @@ int main(int argc, char** argv) {
                 while ((newline = power_buffer.find('\n')) != std::string::npos) {
                     auto event = power_buffer.substr(0, newline); power_buffer.erase(0, newline + 1);
                     std::cout << "POWER " << event << std::endl;
-                    if (event.find("goingToScreenSaver") != std::string::npos) { sleeping = true; shell.sleep(); }
-                    if (event.find("outOfScreenSaver") != std::string::npos) { sleeping = false; shell.paint(); }
+                    if (event.find("goingToScreenSaver") != std::string::npos) { sleeping = true; status_timer.arm(false); shell.sleep(); }
+                    if (event.find("outOfScreenSaver") != std::string::npos) { sleeping = false; status_timer.arm(true); shell.paint(); }
                 }
                 if (count == 0) throw std::runtime_error("Power observer stopped");
+            }
+            if (descriptors[4].revents & POLLIN) {
+                std::uint64_t expirations = 0;
+                if (read(status_timer.descriptor, &expirations, sizeof(expirations)) == sizeof(expirations) && !sleeping)
+                    shell.refresh_status();
             }
             if (!sleeping && descriptors[2].revents & (POLLIN | POLLHUP)) shell.browser_ready();
             if (descriptors[0].revents & (POLLERR | POLLHUP | POLLNVAL)) throw std::runtime_error("Touch disconnected");
@@ -487,6 +649,6 @@ int main(int argc, char** argv) {
             }
         }
         shell.save(); close(touch); close(lock);
-        return 0;
+        return handoff;
     } catch (const std::exception& error) { std::cerr << error.what() << std::endl; return 1; }
 }

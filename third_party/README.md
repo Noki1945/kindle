@@ -9,3 +9,8 @@
 Files downloaded from the named upstream tags. No network dependency at build time.
 Book text import uses XML and ZIP libraries; it does not launch another reader app.
 The installed Kindle /usr/bin/curl provides HTTPS with its certificate checks enabled.
+
+The optional kbrowser and KOReader engine archives are downloaded from their
+upstream releases using config/optional-engines.json. Their binaries are not
+included in the small shell release archive. The GPL-3.0-or-later reader worker
+is accompanied by the GPL text in GPL-3.0.txt.
