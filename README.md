@@ -9,6 +9,8 @@ jailbreak/USBNetLite/MRPI. Это новая пользовательская с
 
 Для установки скачайте PW4-архив из [релиза Alpha 0.2](https://github.com/Noki1945/kindle/releases/tag/v0.2.0-alpha). Большие движки подготавливаются отдельным скриптом с проверкой SHA-256, инструкции находятся в README архива. [Alpha 0.1](docs/releases/0.1-alpha.md) сохранена как предыдущая версия.
 
+[Схема всей системы снизу вверх и таблица сохранённых/заменённых компонентов](docs/system-map.md).
+
 ## Запуск на Windows
 
 Нужны Visual Studio Build Tools 2019 или новее с компонентами Desktop development with C++ и CMake tools. VS Code: открыть эту папку, выполнить задачу **Run simulator**.
