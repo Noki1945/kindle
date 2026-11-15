@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(KindleLiteOS VERSION 0.2.0 LANGUAGES C CXX)
+project(KindleLiteOS VERSION 1.0.0 LANGUAGES C CXX)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 add_library(kindle_core src/library/catalog.cpp src/reader/text_reader.cpp src/core/state.cpp src/core/device_status.cpp src/eink/refresh.cpp)
