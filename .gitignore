@@ -8,4 +8,6 @@
 *.key
 kindle_ed25519*
 known_hosts
+/private/
+/vpn.enabled
 *.user

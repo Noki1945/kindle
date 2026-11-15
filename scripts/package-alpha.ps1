@@ -14,6 +14,7 @@ foreach($pair in @(@('kindle-launch.sh','launch.sh'),@('kindle-boot.sh','boot.sh
     Copy-Item -LiteralPath ('scripts/'+$pair[0]) -Destination (Join-Path $device $pair[1])
 }
 Copy-Item -LiteralPath config/kindle-lite.conf,config/kindle-lite-wake.conf,config/chromium-pw4.conf -Destination $device
+Copy-Item -LiteralPath scripts/kindle-vpn.sh -Destination (Join-Path $device 'vpn.sh')
 New-Item -ItemType Directory -Force -Path (Join-Path $device 'scripts'),(Join-Path $device 'config') | Out-Null
 Copy-Item -LiteralPath scripts/prepare-optional-engines.ps1 -Destination (Join-Path $device 'scripts')
 Copy-Item -LiteralPath config/optional-engines.json,config/full-browser.conf -Destination (Join-Path $device 'config')

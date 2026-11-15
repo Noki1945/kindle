@@ -6,12 +6,14 @@ url="${1:-https://www.google.com/}"
 case "$url" in https://*) ;; *) echo 'Only HTTPS addresses are accepted'; exit 1 ;; esac
 [ -f "$engine" ] && [ -f /mnt/us/kbrowser/kbrowser.ext3 ] || exit 1
 child=
+vpn_session=no
 pillow_was_running=no
 status pillow | grep -q start/running && pillow_was_running=yes
 cleanup() {
     trap - EXIT INT TERM HUP
     if [ -n "$child" ]; then kill -TERM "$child" 2>/dev/null; wait "$child" 2>/dev/null; fi
     if grep -q ' /var/tmp/kbrowser ' /proc/mounts; then sh "$engine" cleanup; fi
+    if [ "$vpn_session" = yes ]; then sh "$base/vpn.sh" stop || true; fi
     # The old mount utility can leave loop devices attached after unmounting.
     for backing in /sys/block/loop*/loop/backing_file; do
         read -r image < "$backing" || continue
@@ -31,6 +33,10 @@ cleanup() {
 }
 trap cleanup EXIT
 trap 'exit 143' INT TERM HUP
+if [ -f "$base/vpn.enabled" ]; then
+    [ -f "$base/vpn.sh" ] && sh "$base/vpn.sh" start || exit 1
+    vpn_session=yes
+fi
 if [ "$pillow_was_running" = no ]; then start pillow || exit 1; fi
 export KINDLE_LITE_URL="$url"
 sh "$engine" start chromium &

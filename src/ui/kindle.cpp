@@ -419,6 +419,7 @@ public:
             background.rectangle(24, 970, 494, 160, 120, 2); background.rectangle(554, 970, 494, 160, 120, 2);
         }
         if (scene != 1 || reading) for (int button = 0; button < 3; ++button) background.rectangle(20 + button * 357, 1300, 318, 128, 80, 2);
+        if (!reading && scene == 2) background.rectangle(24, 810, 1024, 80, 120, 2);
         background.show();
         text(25, 100, "Kindle Lite OS", 32, 40, 420);
         refresh_status(true);
@@ -449,7 +450,9 @@ public:
             text(300, 360, "Размер шрифта: " + std::to_string(settings.font));
             text(390, 480, "Уменьшить", 36, 40, 500);
             text(390, 480, "Увеличить", 36, 576, 1032);
-            text(560, 830, "Два режима: чтение и интернет.\n\nПодключить Wi-Fi или точку доступа телефона можно в интерфейсе Amazon.");
+            text(560, 800, "Два режима: чтение и интернет.\n\nПодключить Wi-Fi или точку доступа телефона можно в интерфейсе Amazon.");
+            const bool vpn_ready = fs::exists("private/vpn/config.json") && fs::exists("vpn.sh");
+            text(825, 890, !vpn_ready ? "VPN браузера: не настроен" : fs::exists("vpn.enabled") ? "VPN браузера: включён" : "VPN браузера: выключен", 30);
             text(900, 980, fs::exists("autostart.enabled") ? "Автозапуск: включён" : "Автозапуск: выключен", 32);
             text(1010, 1080, "Открыть последнюю книгу");
             text(1110, 1190, "Перейти к сохранённой закладке");
@@ -502,6 +505,13 @@ public:
             } else return;
         } else if (scene == 2) {
             if (y >= 320 && y < 500) { settings.font = x < 536 ? std::max(16u, settings.font - 2) : std::min(32u, settings.font + 2); save(); }
+            else if (y >= 810 && y < 890) {
+                if (fs::exists("vpn.enabled")) fs::remove("vpn.enabled");
+                else if (fs::exists("private/vpn/config.json") && fs::exists("vpn.sh")) {
+                    std::ofstream flag("vpn.enabled");
+                    if (!flag) throw std::runtime_error("Cannot enable browser VPN");
+                }
+            }
             else if (y >= 900 && y < 980) {
                 if (fs::exists("autostart.enabled")) fs::remove("autostart.enabled");
                 else { std::ofstream flag("autostart.enabled"); if (!flag) throw std::runtime_error("Cannot enable autostart"); }
